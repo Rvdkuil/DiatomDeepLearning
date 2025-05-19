@@ -4,22 +4,27 @@
 ###############################################################################
 
 # Import libraries
+import os
 import shutil
-from pathlib import Path
-from collections import Counter
-from IPython.display import clear_output
 import json
 import yaml
+import glob
+import random
+import subprocess
+from collections import Counter
+from pathlib import Path
+from IPython.display import clear_output
+
+import cv2
 import numpy as np
 import pandas as pd
-from ultralytics import YOLO
 from sklearn.model_selection import StratifiedKFold
-import glob, os
-import subprocess
+from ultralytics import YOLO
 
 # Set paths
 annotations_directory = "D:/sorted_images/combi"
 kfold_base_path = Path("D:/sorted_images/combi/k_fold")
+bg_images = "D:/Sorted_images/bbb"
 
 #%%
 # Preprocess annotations. Change labels of species with <30 instances to "other"
@@ -98,8 +103,7 @@ for label, count in processed_counts.items():
 
 #%%
 # Convert labelme annotations to the format accepted by YOLO
-def convert_to_yolo(processed_dir):
-    """Runs the labelme2yolo command silently (no output)."""
+def convert_to_yolo(processed_dir):    
     
     if not os.path.exists(processed_dir):
         print(f"Error: The directory {processed_dir} does not exist.")
@@ -120,6 +124,140 @@ def convert_to_yolo(processed_dir):
 # Run the conversion
 convert_to_yolo(processed_dir)
 
+#%%
+# Perform image padding
+def get_random_patch(bg_image, patch_height, patch_width):
+    h, w, _ = bg_image.shape
+
+    # Resize background image if it's too small
+    if h < patch_height or w < patch_width:
+        scale_y = patch_height / h
+        scale_x = patch_width / w
+        scale = max(scale_y, scale_x)
+        new_w = int(w * scale) + 1
+        new_h = int(h * scale) + 1
+        bg_image = cv2.resize(bg_image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        h, w = bg_image.shape[:2]
+
+    # Now we are sure it's large enough
+    y = random.randint(0, h - patch_height)
+    x = random.randint(0, w - patch_width)
+    return bg_image[y:y+patch_height, x:x+patch_width]
+
+def pad_image_with_background(image, target_size, background_images):
+    h, w, _ = image.shape
+
+    pad_top = (target_size - h) // 2
+    pad_side = (target_size - w) // 2
+
+    # Start with black canvas
+    padded_image = np.zeros((target_size, target_size, 3), dtype=np.uint8)
+
+    # Paste the original image
+    padded_image[pad_top:pad_top+h, pad_side:pad_side+w] = image
+
+    # Define padding areas
+    regions = {
+        "top": (0, pad_top, pad_side, pad_side + w),
+        "bottom": (pad_top + h, target_size, pad_side, pad_side + w),
+        "left": (pad_top, pad_top + h, 0, pad_side),
+        "right": (pad_top, pad_top + h, pad_side + w, target_size),
+        "top_left": (0, pad_top, 0, pad_side),
+        "top_right": (0, pad_top, pad_side + w, target_size),
+        "bottom_left": (pad_top + h, target_size, 0, pad_side),
+        "bottom_right": (pad_top + h, target_size, pad_side + w, target_size)
+    }
+
+    # Fill each region with a patch from a background image
+    for name, (y_start, y_end, x_start, x_end) in regions.items():
+        patch_h = y_end - y_start
+        patch_w = x_end - x_start
+        if patch_h > 0 and patch_w > 0:
+            bg_img = random.choice(background_images)
+            patch = get_random_patch(bg_img, patch_h, patch_w)
+            padded_image[y_start:y_end, x_start:x_end] = patch
+
+    return padded_image, pad_top, pad_side
+
+def load_background_images(bg_folder):
+    bg_images = []
+    for f in os.listdir(bg_folder):
+        if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff')):  # ← added tif/tiff
+            img_path = os.path.join(bg_folder, f)
+            img = cv2.imread(img_path)
+            if img is not None:
+                bg_images.append(img)
+            else:
+                print(f"⚠️ Could not load background image: {img_path}")
+    print(f"✅ Loaded {len(bg_images)} background images from '{bg_folder}'")
+    return bg_images
+
+def pad_image_and_adjust_annotations(input_image_folder, input_annotation_folder,
+                                     output_image_folder, output_annotation_folder,
+                                     bg_folder, target_size=1216):
+    os.makedirs(output_image_folder, exist_ok=True)
+    os.makedirs(output_annotation_folder, exist_ok=True)
+
+    image_files = [f for f in os.listdir(input_image_folder) if f.endswith(('.png', '.jpg', '.jpeg'))]
+    background_images = load_background_images(bg_folder)
+
+    for image_file in image_files:
+        image_path = os.path.join(input_image_folder, image_file)
+        annotation_path = os.path.join(input_annotation_folder, os.path.splitext(image_file)[0] + ".txt")
+
+        if not os.path.exists(annotation_path):
+            print(f"Skipping {image_file} (annotation file not found).")
+            continue
+
+        image = cv2.imread(image_path)
+        if image is None:
+            print(f"Skipping {image_file} (could not load).")
+            continue
+
+        h, w, _ = image.shape
+        padded_image, pad_top, pad_left = pad_image_with_background(image, target_size, background_images)
+
+        # Adjust annotations
+        with open(annotation_path, "r") as f:
+            lines = f.readlines()
+
+        updated_lines = []
+        for line in lines:
+            parts = line.strip().split()
+            category = parts[0]
+            coords = list(map(float, parts[1:]))
+
+            adjusted_coords = []
+            for i in range(0, len(coords), 2):
+                x, y = coords[i], coords[i + 1]
+                abs_x = x * w
+                abs_y = y * h
+                new_x = (abs_x + pad_left) / target_size
+                new_y = (abs_y + pad_top) / target_size
+                adjusted_coords.extend([new_x, new_y])
+
+            updated_line = f"{category} " + " ".join(f"{coord:.6f}" for coord in adjusted_coords) + "\n"
+            updated_lines.append(updated_line)
+
+        output_image_path = os.path.join(output_image_folder, image_file)
+        output_annotation_path = os.path.join(output_annotation_folder, os.path.splitext(image_file)[0] + ".txt")
+
+        cv2.imwrite(output_image_path, padded_image)
+        with open(output_annotation_path, "w") as f:
+            f.writelines(updated_lines)
+
+        print(f"Processed: {image_file}")
+
+# Perform image padding
+for split in ["train", "val"]:
+    pad_image_and_adjust_annotations(
+        input_image_folder=os.path.join(processed_dir, f"YOLODataset/images/{split}"),
+        input_annotation_folder=os.path.join(processed_dir, f"YOLODataset/labels/{split}"),
+        output_image_folder=os.path.join(processed_dir, f"YOLODataset/images/{split}"),
+        output_annotation_folder=os.path.join(processed_dir, f"YOLODataset/labels/{split}"),
+        bg_folder=bg_images
+    )
+    
 #%%
 # Move label files and image files to the same directory and update the filepaths
 dataset_path = os.path.join(processed_dir, "YOLODataset")  # Base dataset path
@@ -169,9 +307,6 @@ def move_files_and_cleanup(base_directory):
 
 # Run the cleanup and file movement
 move_files_and_cleanup(dataset_path)
-
-#%%
-# Add background images (still need to automate)
 
 #%%
 # Store image and label paths for future use
