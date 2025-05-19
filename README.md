@@ -1,2 +1,2 @@
 # DiatomDeepLearning
-Repository for training the YOLOv8 object detection model on diatom images
+Repository for training the YOLOv11 object detection model on diatom images
