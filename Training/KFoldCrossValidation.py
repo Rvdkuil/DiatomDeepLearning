@@ -1,0 +1,645 @@
+###############################################################################################################
+## k-fold cross-validation as adapted from https://docs.ultralytics.com/guides/kfold-cross-validation/#setup ## 
+## and https://www.kaggle.com/code/tataganesh/k-fold-cross-validation-and-yolov8                             ##
+###############################################################################################################
+
+# Import libraries
+import os
+import shutil
+import json
+import yaml
+import glob
+import random
+import pickle
+import subprocess
+from collections import Counter
+from pathlib import Path
+from IPython.display import clear_output
+
+import cv2
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import StratifiedKFold
+from ultralytics import YOLO
+
+# Set paths
+annotations_directory = "C:/Users/rvdku/Desktop/New folder/Sorted_images/combi"
+kfold_base_path = Path("C:/Users/rvdku/Desktop/New folder/Sorted_images/combi/k_fold")
+bg_images = "C:/Users/rvdku/Desktop/New folder/Sorted_images/bbb"
+species_file = "C:/Users/rvdku/Desktop/New folder/paper/ExcelData/Species_names.xlsx"                     
+
+#%%                                     
+# Load dataframe from Excel
+df = pd.read_excel(species_file, sheet_name="Sheet1")
+df["Delete"] = df["Delete"].astype(bool)
+
+# Labels to delete
+delete_labels = set(df[df["Delete"]]["LabelmeCode"])
+
+# Process JSON files
+for filename in os.listdir(annotations_directory):
+    if not filename.endswith(".json"):
+        continue
+
+    json_path = os.path.join(annotations_directory, filename)
+
+    with open(json_path, "r") as f:
+        data = json.load(f)
+
+    shapes = data.get("shapes", [])
+    original_labels = {shape["label"] for shape in shapes}
+
+    # Delete entire file if all labels are to be deleted
+    if original_labels.issubset(delete_labels):
+        os.remove(json_path)
+        print(f"Deleted entire file: {filename}")
+        continue
+
+    # Remove only the unwanted annotations
+    new_shapes = [shape for shape in shapes if shape["label"] not in delete_labels]
+
+    if len(new_shapes) != len(shapes):
+        data["shapes"] = new_shapes
+        with open(json_path, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"Removed deleted labels from: {filename}")
+
+#%%
+# Rename the labels 
+rename_map = dict(zip(df["LabelmeCode"], df["New code"]))
+
+# Process JSON files
+for filename in os.listdir(annotations_directory):
+    if not filename.endswith(".json"):
+        continue
+
+    json_path = os.path.join(annotations_directory, filename)
+
+    with open(json_path, "r") as f:
+        data = json.load(f)
+
+    shapes = data.get("shapes", [])
+    updated = False
+
+    for shape in shapes:
+        old_label = shape["label"]
+        if old_label in rename_map:
+            new_label = rename_map[old_label]
+            if new_label != old_label:
+                shape["label"] = new_label
+                updated = True
+
+    if updated:
+        with open(json_path, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"Renamed labels in: {filename}")
+
+
+#%%
+# Preprocess annotations. Optional: Change labels of species with less than a 
+# certain amount of instances to "other". Otherwise set min_instances to 0.
+def process_annotations(directory, min_instances=15):
+    label_counts = {} 
+    processed_label_counts = {}  
+    processed_dir = os.path.join(directory, "processed_annotations")
+    
+    os.makedirs(processed_dir, exist_ok=True) 
+
+    print("Processing annotation files...")
+
+    # Count labels and process files
+    for filename in os.listdir(directory):
+        if not filename.endswith(".json"):
+            continue  
+
+        filepath = os.path.join(directory, filename)
+        processed_filepath = os.path.join(processed_dir, filename)
+
+        try:
+            with open(filepath, "r") as file:
+                data = json.load(file)
+            
+            # Count initial label occurrences
+            for shape in data.get("shapes", []):
+                label = shape.get("label")
+                label_counts[label] = label_counts.get(label, 0) + 1
+
+        except Exception as e:
+            print(f"Error reading {filepath}: {e}")
+            continue  
+
+    # Process files and update labels
+    for filename in os.listdir(directory):
+        if not filename.endswith(".json"):
+            continue
+
+        filepath = os.path.join(directory, filename)
+        processed_filepath = os.path.join(processed_dir, filename)
+
+        try:
+            with open(filepath, "r") as file:
+                data = json.load(file)
+
+            for shape in data.get("shapes", []):
+                original_label = shape["label"]
+                if label_counts.get(original_label, 0) < min_instances:
+                    shape["label"] = "other"  
+
+                # Update processed label counts
+                new_label = shape["label"]
+                processed_label_counts[new_label] = processed_label_counts.get(new_label, 0) + 1
+
+            # Save modified annotations
+            with open(processed_filepath, "w") as processed_file:
+                json.dump(data, processed_file, indent=4)
+
+        except Exception as e:
+            print(f"Error processing {filepath}: {e}")
+
+    return label_counts, processed_label_counts, processed_dir  
+
+# Run the processing function
+initial_counts, processed_counts, processed_dir = process_annotations(annotations_directory)
+
+# Print initial summary
+print("\nInitial Label Summary:")
+for label, count in initial_counts.items():
+    print(f"{label}: {count} instances")
+
+# Print processed summary
+print("\nProcessed Label Summary:")
+for label, count in processed_counts.items():
+    print(f"{label}: {count} instances")
+
+#%%
+# Convert labelme annotations to the format accepted by YOLO. Make sure you have 
+# Labelme2Yolo installed.
+def convert_to_yolo(processed_dir):    
+    
+    if not os.path.exists(processed_dir):
+        print(f"Error: The directory {processed_dir} does not exist.")
+        return
+
+    command = [
+        "labelme2yolo",
+        "--json_dir", processed_dir,
+        "--val_size", "0.0",
+        "--output_format", "polygon"
+    ]
+    
+    try:
+        subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    except subprocess.CalledProcessError:
+        print("Error: labelme2yolo command failed.")
+
+# Run the conversion
+convert_to_yolo(processed_dir)
+
+#%%
+# Use background patches to pad the images to a uniform size.
+def get_random_patch(bg_image, patch_height, patch_width):
+    h, w, _ = bg_image.shape
+
+    # Resize background image if it's too small
+    if h < patch_height or w < patch_width:
+        scale_y = patch_height / h
+        scale_x = patch_width / w
+        scale = max(scale_y, scale_x)
+        new_w = int(w * scale) + 1
+        new_h = int(h * scale) + 1
+        bg_image = cv2.resize(bg_image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        h, w = bg_image.shape[:2]
+
+    # Now we are sure it's large enough
+    y = random.randint(0, h - patch_height)
+    x = random.randint(0, w - patch_width)
+    return bg_image[y:y+patch_height, x:x+patch_width]
+
+def pad_image_with_background(image, target_size, background_images):
+    h, w, _ = image.shape
+
+    pad_top = (target_size - h) // 2
+    pad_side = (target_size - w) // 2
+
+    # Start with black canvas
+    padded_image = np.zeros((target_size, target_size, 3), dtype=np.uint8)
+
+    # Paste the original image
+    padded_image[pad_top:pad_top+h, pad_side:pad_side+w] = image
+
+    # Define padding areas
+    regions = {
+        "top": (0, pad_top, pad_side, pad_side + w),
+        "bottom": (pad_top + h, target_size, pad_side, pad_side + w),
+        "left": (pad_top, pad_top + h, 0, pad_side),
+        "right": (pad_top, pad_top + h, pad_side + w, target_size),
+        "top_left": (0, pad_top, 0, pad_side),
+        "top_right": (0, pad_top, pad_side + w, target_size),
+        "bottom_left": (pad_top + h, target_size, 0, pad_side),
+        "bottom_right": (pad_top + h, target_size, pad_side + w, target_size)
+    }
+
+    # Fill each region with a patch from a background image
+    for name, (y_start, y_end, x_start, x_end) in regions.items():
+        patch_h = y_end - y_start
+        patch_w = x_end - x_start
+        if patch_h > 0 and patch_w > 0:
+            bg_img = random.choice(background_images)
+            patch = get_random_patch(bg_img, patch_h, patch_w)
+            padded_image[y_start:y_end, x_start:x_end] = patch
+
+    return padded_image, pad_top, pad_side
+
+def load_background_images(bg_folder):
+    bg_images = []
+    for f in os.listdir(bg_folder):
+        if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff')): 
+            img_path = os.path.join(bg_folder, f)
+            img = cv2.imread(img_path)
+            if img is not None:
+                bg_images.append(img)
+            else:
+                print(f"⚠️ Could not load background image: {img_path}")
+    print(f"✅ Loaded {len(bg_images)} background images from '{bg_folder}'")
+    return bg_images
+
+def pad_image_and_adjust_annotations(input_image_folder, input_annotation_folder,
+                                     output_image_folder, output_annotation_folder,
+                                     bg_folder, target_size=1216):
+    os.makedirs(output_image_folder, exist_ok=True)
+    os.makedirs(output_annotation_folder, exist_ok=True)
+
+    image_files = [f for f in os.listdir(input_image_folder) if f.endswith(('.png', '.jpg', '.jpeg'))]
+    background_images = load_background_images(bg_folder)
+
+    for image_file in image_files:
+        image_path = os.path.join(input_image_folder, image_file)
+        annotation_path = os.path.join(input_annotation_folder, os.path.splitext(image_file)[0] + ".txt")
+
+        if not os.path.exists(annotation_path):
+            print(f"Skipping {image_file} (annotation file not found).")
+            continue
+
+        image = cv2.imread(image_path)
+        if image is None:
+            print(f"Skipping {image_file} (could not load).")
+            continue
+
+        h, w, _ = image.shape
+        padded_image, pad_top, pad_left = pad_image_with_background(image, target_size, background_images)
+
+        # Adjust annotations
+        with open(annotation_path, "r") as f:
+            lines = f.readlines()
+
+        updated_lines = []
+        for line in lines:
+            parts = line.strip().split()
+            category = parts[0]
+            coords = list(map(float, parts[1:]))
+
+            adjusted_coords = []
+            for i in range(0, len(coords), 2):
+                x, y = coords[i], coords[i + 1]
+                abs_x = x * w
+                abs_y = y * h
+                new_x = (abs_x + pad_left) / target_size
+                new_y = (abs_y + pad_top) / target_size
+                adjusted_coords.extend([new_x, new_y])
+
+            updated_line = f"{category} " + " ".join(f"{coord:.6f}" for coord in adjusted_coords) + "\n"
+            updated_lines.append(updated_line)
+
+        output_image_path = os.path.join(output_image_folder, image_file)
+        output_annotation_path = os.path.join(output_annotation_folder, os.path.splitext(image_file)[0] + ".txt")
+
+        cv2.imwrite(output_image_path, padded_image)
+        with open(output_annotation_path, "w") as f:
+            f.writelines(updated_lines)
+
+        print(f"Processed: {image_file}")
+
+# Perform image padding
+for split in ["train", "val"]:
+    pad_image_and_adjust_annotations(
+        input_image_folder=os.path.join(processed_dir, f"YOLODataset/images/{split}"),
+        input_annotation_folder=os.path.join(processed_dir, f"YOLODataset/labels/{split}"),
+        output_image_folder=os.path.join(processed_dir, f"YOLODataset/images/{split}"),
+        output_annotation_folder=os.path.join(processed_dir, f"YOLODataset/labels/{split}"),
+        bg_folder=bg_images
+    )
+    
+#%%
+# Move label files and image files to the same directory and update the filepaths
+dataset_path = os.path.join(processed_dir, "YOLODataset")  # Base dataset path
+images_directory = os.path.join(dataset_path, "images")
+labels_directory = os.path.join(dataset_path, "labels")
+yaml_file_path = os.path.join(dataset_path, "dataset.yaml")
+
+def move_files_and_cleanup(base_directory):
+    # Define subdirectories to handle moving files for both images and labels
+    subfolders = ["train", "val"]
+
+    # Move images from "train" and "val" subdirectories to "images" directory
+    for subfolder in subfolders:
+        subfolder_path = os.path.join(images_directory, subfolder)
+        if os.path.exists(subfolder_path):
+            for filename in os.listdir(subfolder_path):
+                file_path = os.path.join(subfolder_path, filename)
+                if os.path.isfile(file_path):
+                    shutil.move(file_path, images_directory)
+            shutil.rmtree(subfolder_path)
+
+    # Copy label files from "labels/train" and "labels/val" to both "images" and "labels" directories
+    for subfolder in subfolders:
+        subfolder_path = os.path.join(labels_directory, subfolder)
+        if os.path.exists(subfolder_path):
+            for filename in os.listdir(subfolder_path):
+                file_path = os.path.join(subfolder_path, filename)
+                if filename.endswith(".txt") and os.path.isfile(file_path):
+                    # Copy label file to images directory
+                    shutil.copy(file_path, images_directory)
+                    # Copy label file to labels directory (though they are already there)
+                    shutil.copy(file_path, labels_directory)
+            shutil.rmtree(subfolder_path)
+
+    # Update the YAML file paths
+    if os.path.exists(yaml_file_path):
+        with open(yaml_file_path, "r") as file:
+            yaml_data = yaml.safe_load(file)
+
+        # Updating paths for images in YAML file
+        yaml_data["train"] = images_directory.replace("//", "/")
+        yaml_data["val"] = os.path.join(images_directory, "val").replace("//", "/")
+
+        # Write the updated YAML back to file
+        with open(yaml_file_path, "w") as file:
+            yaml.safe_dump(yaml_data, file)
+
+# Run the cleanup and file movement
+move_files_and_cleanup(dataset_path)
+
+#%%
+# Store image and label paths for future use
+# Get all .png and .tif files
+png_files = glob.glob(images_directory + "/*.png")
+tif_files = glob.glob(images_directory + "/*.tif")
+
+# Combine the lists
+image_paths = png_files + tif_files
+
+# Find all label files
+label_paths = glob.glob(images_directory + "/*.txt")
+
+print(f"Found {len(image_paths)} images and {len(label_paths)} labels.")
+
+#%%
+# Get label names from the .yaml file
+dataset_path = Path(dataset_path)
+labels = sorted(dataset_path.rglob("images/*.txt")) 
+
+yaml_file = os.path.join(dataset_path, "dataset.yaml") 
+with open(yaml_file, "r", encoding="utf8") as y:
+    classes = yaml.safe_load(y)["names"]
+cls_idx = list(range(len(classes)))
+print(list(zip(classes, cls_idx)))
+
+#%%
+# Generate a dataframe to calculate the label distribution
+indx = [Path(img).stem for img in image_paths]  
+labels_df = pd.DataFrame([], columns=cls_idx, index=indx)
+
+# Create the label vector for stratification
+y = []
+
+# Create a set of label stems for quick lookup
+label_stems = {label.stem for label in labels}
+
+# Separate labeled and unlabeled images
+labeled_images = []
+unlabeled_images = []
+
+for img_path in image_paths:
+    img_stem = Path(img_path).stem
+    
+    if img_stem in label_stems:
+        labeled_images.append(img_path)
+        label_file = next(label for label in labels if label.stem == img_stem)
+        lbl_counter = Counter()
+        
+        with open(label_file, "r") as lf:
+            lines = lf.readlines()
+
+        for l in lines:
+            # classes for YOLO label uses integer at first position of each line
+            lbl_counter[int(l.split(" ")[0])] += 1
+
+        # Use the first class in the label file for stratification
+        if lines:
+            first_class = int(lines[0].split(" ")[0])
+            y.append(first_class)
+        else:
+            y.append(-1)  # Handle empty label files if necessary
+
+        labels_df.loc[img_stem] = lbl_counter
+    else:
+        unlabeled_images.append(img_path)
+        # Fill the DataFrame with zeros or any default value for the unlabeled images
+        labels_df.loc[img_stem] = [0] * len(cls_idx)
+
+labels_df = labels_df.fillna(0.0)  
+print(labels_df)
+
+#%%
+# Create the training and validation splits
+# Convert y to numpy array
+y = np.array(y)
+
+# use sklearn to perform the StratitfiedKFold
+ksplit = 5
+kf = StratifiedKFold(n_splits=ksplit, shuffle=True, random_state=20)  
+
+labeled_indices = [indx.index(Path(img).stem) for img in labeled_images]
+kfolds = []
+
+for train_index, test_index in kf.split(np.zeros(len(labeled_indices)), y):
+    train_indices = [labeled_indices[i] for i in train_index]
+    test_indices = [labeled_indices[i] for i in test_index]
+    
+    # Add all unlabeled .tif image indices to the training set
+    unlabeled_indices = [
+        indx.index(Path(img).stem) 
+        for img in unlabeled_images 
+        if img.endswith(".tif") and Path(img).stem in indx
+    ]
+    train_indices += unlabeled_indices
+    
+    kfolds.append((train_indices, test_indices))
+
+#%%
+# Get the label distribution in each split
+folds = [f"split_{n}" for n in range(1, ksplit + 1)]
+fold_lbl_distrb = pd.DataFrame(index=folds, columns=cls_idx)
+
+for n, (train_indices, val_indices) in enumerate(kfolds, start=1):
+    train_totals = labels_df.iloc[train_indices].sum()
+    val_totals = labels_df.iloc[val_indices].sum()
+
+    # To avoid division by zero, we add a small value (1E-7) to the denominator
+    ratio = val_totals / (train_totals + 1E-7)
+    fold_lbl_distrb.loc[f"split_{n}"] = ratio
+
+lbl_distribution = fold_lbl_distrb
+print(lbl_distribution)
+
+#%%
+# Create .yaml and .txt files for each fold
+
+shutil.rmtree(kfold_base_path) if kfold_base_path.is_dir() else None # Remove existing folder
+os.makedirs(str(kfold_base_path)) # Create new folder
+yaml_paths = list()
+train_txt_paths = list()
+val_txt_paths = list()
+for i, (train_idx, val_idx) in enumerate(kfolds):
+    # Get image paths for train-val split
+    train_paths = [image_paths[j] for j in train_idx]
+    val_paths = [image_paths[j] for j in val_idx]
+
+    # Create text files to store image paths
+    train_txt = kfold_base_path / f"train_{i}.txt"
+    val_txt = kfold_base_path / f"val_{i}.txt"
+
+    # Write image paths for training and validation in split i
+    with open(str(train_txt), "w") as f:
+        f.writelines(s + "\n" for s in train_paths)
+    with open(str(val_txt), "w") as f:
+        f.writelines(s + "\n" for s in val_paths)
+
+    train_txt_paths.append(str(train_txt))
+    val_txt_paths.append(str(val_txt))
+
+    # Create yaml file
+    yaml_path = kfold_base_path / f"data_{i}.yaml"
+    with open(yaml_path, "w") as ds_y:
+        yaml.safe_dump({
+            "train": str(train_txt),
+            "val": str(val_txt),
+            "nc": len(classes),
+            "names": classes
+        }, ds_y)
+    yaml_paths.append(str(yaml_path))
+print("Yaml Paths")
+print(yaml_paths)
+
+#%%
+os.environ["WANDB_DISABLED"] = "true"
+
+batch = 6
+project = "kfold_cross_validation"
+epochs = 500
+patience = 500
+
+results_path = "kfold_results.pkl"
+
+# Load existing results if available
+if os.path.exists(results_path):
+    with open(results_path, "rb") as f:
+        results = pickle.load(f)
+    start_fold = len(results)
+    print(f"Resuming from fold {start_fold}...")
+else:
+    results = []
+    start_fold = 0
+    print("Starting fresh...")
+
+# Continue training remaining folds
+for i in range(start_fold, ksplit):
+    model = YOLO("yolo11s-seg.pt")
+    dataset_yaml = yaml_paths[i]
+    print(f"Training for fold={i} using {dataset_yaml}")
+    
+    model.train(
+        data=dataset_yaml,
+        epochs=epochs,
+        batch=batch,
+        device=0,
+        patience=patience,
+        verbose=True,
+        plots=True,
+        imgsz=1216,
+        lr0=0.00971,
+        momentum=0.95991,
+        box=7.5,
+        cls=1.0,
+        hsv_h=0.01461,
+        hsv_s=0.49144,
+        hsv_v=0.3615,
+        degrees=180,
+        translate=0.05, 
+        scale=0.1,
+        shear=0,
+        perspective=0, 
+        flipud=0,
+        fliplr=0.46436,
+        bgr=0, 
+        mosaic=1, 
+        mixup=0.0, 
+        copy_paste=0, 
+        erasing=0.2, 
+    )
+    
+    result = model.metrics
+    results.append(result)
+
+    # Save to pickle after each fold
+    with open(results_path, "wb") as f:
+        pickle.dump(results, f)
+
+    clear_output()
+    
+#%%
+# Save K-fold results
+metric_values = dict()
+for result in results:
+    for metric, metric_val in result.results_dict.items():
+        if metric not in metric_values:
+            metric_values[metric] = []
+        metric_values[metric].append(metric_val)
+
+metric_df = pd.DataFrame.from_dict(metric_values)
+visualize_metric = ['mean', 'std', 'min', 'max']
+visual = metric_df.describe().loc[visualize_metric]
+metric_df.to_excel("D:/57705 Recovered Data/Ordered_files_diatoms/paper/ExcelData/kfoldresults.xlsx", index=False)
+
+#%%
+# Train the full model
+results = model.train(
+    data="C:/Users/rvdku/Desktop/New folder/Sorted_images/combi/processed_annotations/YOLODataset/dataset.yaml",
+    epochs=500,
+    batch=6,
+    device=0,
+    patience=500,
+    val=False,
+    verbose=True,
+    plots=True,
+    imgsz=1216,
+    lr0=0.00971,
+    momentum=0.95991,
+    box=7.5,
+    cls=1.0,
+    hsv_h=0.01461,
+    hsv_s=0.49144,
+    hsv_v=0.3615,
+    degrees=180,
+    translate=0.05, 
+    scale=0.1,
+    shear=0,
+    perspective=0, 
+    flipud=0,
+    fliplr=0.46436,
+    bgr=0, 
+    mosaic=1, 
+    mixup=0.0, 
+    copy_paste=0, 
+    erasing=0.2, 
+)
