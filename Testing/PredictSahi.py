@@ -5,9 +5,9 @@
 from sahi.predict import get_sliced_prediction
 from sahi import AutoDetectionModel
 
-model_path="C:/Users/Gebruiker/runs/segment/train158/weights/last.pt"
-image_path="D:/tests/SB23_45.5-46_Autofocus_color_63x_0.tif"
-export_dir="E:/"
+model_path="PATH_TO_YOUR_MODEL"
+image_path="PATH_TO_YOUR_IMAGE"
+export_dir="PATH_TO_YOUR_EXP_DIR"
 #%%
 # Instantiate the model
 detection_model = AutoDetectionModel.from_pretrained(
@@ -32,4 +32,5 @@ result = get_sliced_prediction(
 )
 
 # Export visuals
+
 result.export_visuals(export_dir=export_dir, text_size = 1, rect_th = 1)
