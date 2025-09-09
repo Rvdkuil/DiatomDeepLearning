@@ -23,10 +23,10 @@ from sklearn.model_selection import StratifiedKFold
 from ultralytics import YOLO
 
 # Set paths
-annotations_directory = "C:/Users/rvdku/Desktop/New folder/Sorted_images/combi"
-kfold_base_path = Path("C:/Users/rvdku/Desktop/New folder/Sorted_images/combi/k_fold")
-bg_images = "C:/Users/rvdku/Desktop/New folder/Sorted_images/bbb"
-species_file = "C:/Users/rvdku/Desktop/New folder/paper/ExcelData/Species_names.xlsx"                     
+annotations_directory = "PATH_TO_JSON_FILES"
+kfold_base_path = Path("PATH_TO_FOLDER_TO_SAVE_K_FOLD_DATA")
+bg_images = "PATH_TO_FOLDER_WITH_BACKGROUND_IMAGES"
+species_file = "PATH_TO_Species_names.xlsx"                     
 
 #%%                                     
 # Load dataframe from Excel
@@ -173,7 +173,7 @@ for label, count in processed_counts.items():
 
 #%%
 # Convert labelme annotations to the format accepted by YOLO. Make sure you have 
-# Labelme2Yolo installed.
+# Labelme2Yolo installed. If this doesn't work run labelme2yolo from the command line.
 def convert_to_yolo(processed_dir):    
     
     if not os.path.exists(processed_dir):
@@ -609,12 +609,15 @@ for result in results:
 metric_df = pd.DataFrame.from_dict(metric_values)
 visualize_metric = ['mean', 'std', 'min', 'max']
 visual = metric_df.describe().loc[visualize_metric]
-metric_df.to_excel("D:/57705 Recovered Data/Ordered_files_diatoms/paper/ExcelData/kfoldresults.xlsx", index=False)
+kfold_excel = os.path.join(kfold_base_path, "kfoldresults.xlsx")
+metric_df.to_excel(kfold_excel, index=False)
 
 #%%
-# Train the full model
+# Train the full model. The paths in the YAML file might need adjusting since there is no validation set.
+full_model_yaml = os.path.join(processed_dir, "YOLODataset/dataset.yaml")
+
 results = model.train(
-    data="C:/Users/rvdku/Desktop/New folder/Sorted_images/combi/processed_annotations/YOLODataset/dataset.yaml",
+    data= full_model_yaml,
     epochs=500,
     batch=6,
     device=0,
@@ -643,3 +646,4 @@ results = model.train(
     copy_paste=0, 
     erasing=0.2, 
 )
+
