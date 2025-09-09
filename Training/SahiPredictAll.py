@@ -13,9 +13,9 @@ import re
 
 # Set working directory to the directory with the virtual slidescans
 # Set path to the trained model
-wd = "E:/All_scans"
+wd = "PATH_TO_IMAGES"
 os.chdir(wd)
-trained_model = "E:/train153/weights/best.pt"
+trained_model = "PATH_TO_TRAINED_MODEL"
 #%%
 # Create functions to append the species counts to a dataframe
 def count_species(annotations):
@@ -68,7 +68,7 @@ except FileNotFoundError:
 processed_files = set(species_counts.keys())
 
 # Perform the inference. Save original species counts and species counts after size-thresholding.
-for filename in os.listdir('E:/All_scans'):
+for filename in os.listdir(wd):
     if filename in processed_files:
         print(f"Skipping {filename} as it has already been processed.")
         continue
@@ -94,7 +94,8 @@ for filename in os.listdir('E:/All_scans'):
         df_annotations_original = annotations_to_dataframe(coco_annotations)
         species_counts_original[filename] = df_annotations_original.groupby('Species')['Count'].sum()
 
-        # Apply size thresholds
+        # The following list can be used to apply size thresholds for certain species. These will be saved 
+        # in a seperate pickle file
         size_thresholds = {
             'LIN': (294.5, 294.5),
             'PLA': (189.63, 189.63),
@@ -182,4 +183,5 @@ final_columns = ['Species'] + sorted_columns
 df_sorted = df[final_columns]
 #%%
 # Save dataframe to excel
-df_sorted.to_excel("E:/InferenceResults.xlsx", index=False)
+df_sorted.to_excel("InferenceResults.xlsx", index=False)
+
