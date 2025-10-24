@@ -3,4 +3,4 @@ Repository for training the YOLOv11 object detection model on diatom images acco
 
 The "Testing" folder contains the trained model used in the article, and the code to run it on an image and export the visuals. 
 
-The full dataset can be found on kaggle.com/... This includes the annotated diatom images, background images, and an example virtual slide to test the model on.
+The full dataset can be found on (https://www.kaggle.com/datasets/romevanderkuil/diatoms-of-bonaire) This includes the annotated diatom images, background images, and an example virtual slide to test the model on.
